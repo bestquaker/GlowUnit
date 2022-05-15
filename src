@@ -1,0 +1,455 @@
+/*
+GlowUnit
+
+- Direkt nach Einschalten wird die Glühkerze einmal überprüft. Wenn Widerstandswert bzw. Spannungswert über Glühwendel i.O. dann Übergang zum Standy (langsames Blinken (1s/1s), ansonsten dauerhaft schnelles Blinken.
+- Taster einmal kurz drücken für Motorstart und voll Glühen für min 30s LEd leuchtet dauerhaft
+- Taster einmal lang Drücken (länger als 3s) für Kalibrierung Gashebel, verlangt einmal Vollgas und im Anschluss wieder Leerlauf
+(Wenn Gashebelwert sich nicht mehr ändert, aber mindestens einmal geändert hat, dann Wert nehmen.) Während dessen blinkt die LED schnell und zeigt einen erkannten Wert durch  kurzes Dauerleuchten (2s) an.
+- Taster zweimal kurz hintereinander drücken für Kalibrierkurve (LED fängt blinken an mit der Anzahl kurzer Blinks für jeweiligen Einstellpunkt.
+Zwischen Einstellen Gas und Glühpunkt muss der Taster ebenfalls einmal gedrückt werden und die LED leuchtet dann für 2 s Dauerhaft).
+Am Ende Blinkt die LED wieder im Standby Takt (langsames Blinken 1s/1s).
+*/
+
+#include <Arduino.h>
+#include <EEPROM.h>
+#include <Servo.h>
+
+#define pin_rxPwmIn 7 //Pin für PWM Eingang vom Empfänger
+#define pin_glowOut 3 //Digitalpin für PWM für Mosfet mit Glühkerze
+#define pin_led1 13  //Pin der LED
+#define pin_button1 4 //Button Eingang
+//#define kerzeneingang A2 //Analogeingang, welcher hinter Glühkerze geschalten ist um zu überprüfen ob diese funktionsfähig ist. (Funktion kommt noch)
+
+int led1_sw=0; //Softwareschalter um zu checken ob LED ein oder aus
+int nblink=0;   //Blinkzähler für Blinkfunktion
+
+long rxPwm;     //PWM Wert vom Empfängereingang
+long pwmGas[6]; // 6 Kalibrierpunkte bestehend jeweils aus einem Gaswert
+long pwmGlow[6]; // 6 Kalibrierpunkte bestehend jeweils aus einem Glühwert
+
+int glowOut=0; //PWM welches an das MOSFET geht
+//int stepX[5]; //ins Setup verschoben und damit nur temporär (spart RAM)
+//int stepY[5]; //ins Setup verschoben und damit nur temporär (spart RAM)
+long dY[5]; //Verhältnis Glühanteil zu GasPWM für jeweiligen Punkt. Für Interpolation benötgit und im Setup aus PWM Arrays berechnet
+int glowMax; //Maximaler Glühwert der erlaubt ist. Dieser wird fürs Motorstarten verwendet und begrenzt die Interpolation.
+int oldPwm=0;
+long glow=0; //Ungefilterte Variable des PWM Glow Wertes.
+
+int started=0; //Startfunktion einmal ausgeführt? Wenn ja, dann 1, ansonsten 0, auch 0 wenn im STBY. (Byte würde reichen)
+int tast=0; //zustand der Tasterfunktion (Byte würde reichen)
+int sw_ein=0; //Zwischnspeicher für Button Funktion
+int sw_pups=0;
+
+int treffer=0; //Treffervariable für Interpolation
+int n=0; //Zählvariable für Interpolation
+
+unsigned long Tinactive=0;    // aktuelle Inaktivitätszeit
+unsigned long inactivityTime=180000; //Zeit nach der in STBY gestellt wird [ms]
+
+unsigned long lasttimeout=0;//für Blinkfunktion
+unsigned long lastEvent=0; //Timespeicher für Blinkfunktion
+
+unsigned long lastPress=0;  //Time für Button Funktion
+int entprellKurz=50;  //Entprellzeit für Taster
+int entprellLang=500; //Enprellzeit für Taster für langes Drücken
+
+unsigned long startTime=5000;
+
+Servo myservo;
+
+
+//---------------------------------------------------------------------------------------------------------------------------
+//Write EEPROM
+void writeIntIntoEEPROM(int address, int number) //Funktion um ein Int in zwei Byte auf zu teilen und ins EEPROM zu schreiben und darunter zu lesen.
+{
+  EEPROM.write(address, number >> 8);
+  EEPROM.write(address + 1, number & 0xFF);
+}
+
+//---------------------------------------------------------------------------------------------------------------------------
+//Read EEPROM
+int readIntFromEEPROM(int address)
+{
+  return (EEPROM.read(address) << 8) + EEPROM.read(address + 1);
+}
+
+//---------------------------------------------------------------------------------------------------------------------------
+//Setup
+void setup() {
+  
+    pinMode(pin_rxPwmIn, INPUT);
+    pinMode(pin_button1, INPUT);
+    pinMode(pin_led1, OUTPUT);
+    pinMode(pin_glowOut, OUTPUT);
+
+    myservo.attach(6);
+    Serial.begin(9600);
+
+    for(int i=0; i<6; i++) //Einlesen der Werte aus dem EEPROM in die Arrays
+    {
+        pwmGas[i]= readIntFromEEPROM((i+1)*4-2);
+        pwmGlow[i]= readIntFromEEPROM((i+1)*4);
+    }
+  long stepX[5];
+  long stepY[5];
+
+
+    for(int i=0; i<5; i++)
+    {
+        stepX[i]=pwmGas[(i+1)]-pwmGas[i];
+        stepY[i]=pwmGlow[(i+1)]-pwmGlow[i];
+        dY[i]=(stepY[i])*1000/stepX[i];
+     }
+
+    glowMax= readIntFromEEPROM(40);
+
+   // Serial.println(glowMax);
+   for(int i=0; i<=5; i++)
+    {
+        Serial.print("pwmGas: ");
+        Serial.print(i);
+        Serial.print(": ");
+        Serial.println(pwmGas[i]);
+        Serial.print("pwmGlow: ");
+        Serial.print(i);
+        Serial.print(": ");
+        Serial.println(pwmGlow[i]);
+        Serial.println(stepX[i]);
+        Serial.println(stepY[i]);
+        Serial.println(dY[i]);
+    }
+}
+
+int Button()
+{
+    // soll den Taster mit der ausgabevariablen "tast" entprellen, die Zustände unterscheiden und verschiedene Werte zurück geben. (0=nichts, 1=kurzer Druck, 2=langer Druck, 3=Doppeldruck)
+  if (digitalRead(pin_button1)==1 && sw_ein==0)
+  {
+    sw_ein=1;
+    lastPress=millis();
+  }
+  if (sw_ein== 1 && millis() > lastPress+entprellKurz && millis() < lastPress+entprellKurz+entprellLang  && digitalRead(pin_button1)==0)
+  {
+    sw_ein=0;
+    sw_pups++;
+  }
+
+  if (sw_pups==1 && millis() > (lastPress+entprellKurz+entprellLang))
+  {
+    sw_pups=0;
+    tast=1;
+    return 1;
+  }
+  if (sw_pups==2 && millis() > (lastPress+entprellKurz+entprellLang))
+  {
+    sw_pups=0;
+    tast=3;
+    return 3;
+  }
+  /*if (sw_ein==1 && digitalRead(pin_button1)==1 && millis()> (lastPress+entprellLang+entprellKurz))
+  {
+    sw_ein=0;
+    sw_pups=0;
+    tast=2;
+    return 2;
+  }*/
+  if (sw_pups==3 && millis() > (lastPress+entprellKurz+entprellLang))
+  {
+    sw_pups=0;
+    tast=2;
+    return 2;
+  }
+  else
+  {
+    return 0;
+  }
+}
+
+//---------------------------------------------------------------------------------------------------------------------------
+//Blinkfunktion
+void blink(int anzahl, int gap, int timeOut) //darf keine while Schleife enthalten, da ansonsten alles andere unterbrochen werden würde.
+{
+
+
+if (millis() > lasttimeout+timeOut && nblink <anzahl)
+{
+    if (millis() > lastEvent+gap && led1_sw==0 )
+        {
+        led1_sw=1;
+        digitalWrite(pin_led1, HIGH);
+        lastEvent=millis();
+        }
+    else if (millis() > lastEvent+gap && led1_sw==1)
+        {
+        led1_sw=0;
+        digitalWrite(pin_led1, LOW);
+        lastEvent=millis();
+        nblink++;
+        }
+}
+
+else if (nblink==anzahl)
+{
+    lasttimeout=millis();
+    nblink=0;
+}
+}
+
+//---------------------------------------------------------------------------------------------------------------------------
+//Kalibrierkurve
+void kalibrierkurve()
+{
+   //Über die Loop wird in diese Funktion gesprungen. Bedingung: zweimal kurz drücken.
+    pwmGas[5]={0};
+    pwmGlow[5]={0};
+    int gasZ=0; //Punktzähler Gas-Einstellpunkt (Byte würde reichen)
+    int gasGlow=0; //Gas- oder Glühwert, 0 oder 1, linke oder rechte Spalte. Wenn gleich 1, dann darf der PWm wert nicht an das Servo weiter geleitet werden! Dies muss noch implementiert werden. (Byte würde reichen)
+    int nextstate=1500; //Zeit wie lang LED dauerhaft leuchten soll nach speichern des pwmZ Wertes
+    unsigned long lasttime=0;
+
+   while(gasZ <6)
+   {
+   // Serial.println(rxPwm);
+    Serial.println(gasGlow);
+    Serial.println(tast);
+
+        /* for(int i=0; i<5; i++)
+    {
+        Serial.print(pwmGas[i]);
+        Serial.print("_____");
+        Serial.print(pwmGlow[i]);
+         Serial.print("_____");
+    } */
+
+//Wenn Glüheinstellung erfolgt, soll das Gas auf altem Wert stehen bleiben, und der Glühwert per pwm verändert werden.
+    rxPwm=pulseIn(pin_rxPwmIn, HIGH);
+    if (gasGlow==1)
+        {
+            myservo.writeMicroseconds(oldPwm);
+            analogWrite(glowOut, rxPwm);
+        }
+    else
+        {
+            myservo.writeMicroseconds(rxPwm);
+            analogWrite(glowOut, pwmGlow[gasZ]);
+        }
+
+//Wenn Gaswert gespeichert, soll er einmal für Zeit "nextstate" dauerhaft leuchten, ansonsten im Intervall der jeweiligen Einstellung leuchten (starten bei 1, nicht bei 0).
+
+    if (millis() < lasttime + nextstate)
+        {
+            digitalWrite(pin_led1, HIGH);
+        }
+    else
+        {
+            blink(gasZ+1, 500, 2000);
+        }
+
+// Wenn Taster gedrückt, soll entweder Gaswert oder Glühwert übergeben werden
+    if (gasGlow==0 && Button()==1) //sicherlich falsch, aber wenn ein eindeutiger Tastendruck identifieziert wird
+        {
+            pwmGas[gasZ]=rxPwm;
+           // writeIntIntoEEPROM((gasZ+1)*4-2, pwmGas[gasZ]); //auf alle geraden Adressen (Beginn) werden die Werte für gasGlow=0 geschrieben(es werden jeweils zwei Adressen benötigt). +1 damit der Wert immer positiv bleibt.
+            oldPwm=rxPwm;
+            gasGlow=1;
+            lasttime=millis();
+        }
+
+    else if (gasGlow==1 && Button()==1)
+        {
+            pwmGlow[gasZ]=rxPwm;
+            //writeIntIntoEEPROM((gasZ+1)*4, pwmGlow[gasZ]); //auf alle ungeraden Adressen (Beginn) werden die Werte für gasGlow=1 geschrieben (es werden jeweils zwei Adressen benötigt)
+            gasGlow=0;
+            gasZ++;
+        }
+   }
+   tast=0;
+
+// Werte nach GasPwm aufsteigend sortieren
+ //prüfen ob in der while schleife nochmal eine sortierung durchlaufen ist, falls ja, dann nochmal
+int sortiert;
+   do {
+    sortiert=0;
+        for (int i=0; i<=5; i++)
+       {
+           if (pwmGas[i]>pwmGas[i+1])
+           {
+                int temp1=pwmGas[i];
+                pwmGas[i]=pwmGas[i+1];
+                pwmGas[i+1]=temp1;
+
+                temp1=pwmGlow[i];
+                pwmGlow[i]=pwmGlow[i+1];
+                pwmGlow[i+1]=temp1;
+
+                sortiert=1;
+           }
+       }
+
+    } while (sortiert==1);
+
+for (int i=0; i<=5; i++)
+{
+    writeIntIntoEEPROM((i+1)*4-2, pwmGas[i]);
+    writeIntIntoEEPROM((i+1)*4, pwmGlow[i]);
+}
+
+}
+
+//---------------------------------------------------------------------------------------------------------------------------
+//Interpolation
+void interpolation() //Muss jedesmal durchlaufen werden, wenn sich der GasPWM ändert.
+{
+  rxPwm=pulseIn(pin_rxPwmIn, HIGH);
+  myservo.writeMicroseconds(rxPwm);
+  blink(2,200,1000);
+// Serial.println(rxPwm);
+
+int n=0;
+
+while (rxPwm>pwmGas[n] && n<5) //checken in welchem PWM Bereich von den gespeicherten Punkten der aktuelle PWM Wert liegt. Wenn er oberhalb der Kalibrierkurve liegt, wird automatisch in den Maxpunkt gesprungen und extrapoliert
+    {
+    n++;
+    }
+Serial.print(n);
+if (n==0)
+    {
+    glow=pwmGlow[0];
+    }
+
+else if (n==5)
+    {
+    glow=pwmGlow[5];
+    }
+
+else
+    {
+    n--;
+    glow=pwmGlow[n]+(((rxPwm-pwmGas[n])*dY[(n)])/1000);
+    }
+
+analogWrite(pin_glowOut,(glow-1000)/4); //PWM muss von 0 bis 255 gehen
+
+
+Serial.print("  ");
+Serial.println(glow);
+}
+
+//---------------------------------------------------------------------------------------------------------------------------
+//Inaktivitätscheck
+int inactivity() //prüfen ob der Gashebel längere Zeit nicht bewegt wird. Zeit kann über die Variable incativityTime eingestellt werden.
+{
+if (abs(oldPwm-rxPwm)>20)
+    {
+    Tinactive=millis();
+    oldPwm=rxPwm;
+    }
+
+if (millis()> Tinactive+inactivityTime)
+    {
+    return 1; //wenn 1, dann inaktiv
+    }
+
+else
+    {
+    return 0;
+    }
+}
+
+//---------------------------------------------------------------------------------------------------------------------------
+//Einstellung des maximalen Glühwertes
+void maxglow()
+{
+    rxPwm=pulseIn(pin_rxPwmIn, HIGH);
+    oldPwm=rxPwm;
+    while (tast!=1) //bis die Taste einmal kurz gedrückt wird, soll er einfach nur den PWM wert schreiben
+    {
+        Button();
+        rxPwm=pulseIn(pin_rxPwmIn, HIGH);
+        analogWrite(pin_glowOut,glowOut);
+        blink(7,500,2000);
+        myservo.writeMicroseconds(rxPwm);
+
+        //Serial.println(glowOut);
+        //Serial.println(rxPwm);
+        glowMax=rxPwm;
+    }
+        writeIntIntoEEPROM(40, glowMax);
+}
+
+//---------------------------------------------------------------------------------------------------------------------------
+//Motorstartfunktion
+void start() //Funktion für Start, 30s mit maxGlow. Muss nur einmal kurz aktiviert werden und bleibt dann per While-Schleife aktiv.
+{
+    unsigned long lastStart=millis();
+
+    while(millis()<= lastStart+startTime)
+    {
+        Serial.println(glowMax);
+        rxPwm=pulseIn(pin_rxPwmIn, HIGH);
+        glowOut=glowMax;
+        blink(1,100,100);
+        analogWrite(pin_glowOut,glowOut);
+        myservo.writeMicroseconds(rxPwm);
+
+       //Serial.println(glowOut);
+    }
+}
+
+//---------------------------------------------------------------------------------------------------------------------------
+//Buttonfunktion
+
+//---------------------------------------------------------------------------------------------------------------------------
+//Loop
+void loop()
+{
+/*Überprüfen in welchem Modus er ist und ausführen der entsprechenden Funktion:
+- Nach Start in standBy, nix passiert und er blinkt nur langsam einmal kurz (alle 2s für 300ms) bzw. Prüft ob der Glühwendel i.O. ist. Falls nicht, schnelles, nerviges Blinken.
+- kurzer Druck, dann in Startmode (Dauerblinken und mit MaxWert heizen) Im Neuzustand muss der Maxwert auf sehr wenig eingestellt werden. Nach den 30s auf den Aktivmode mit normalem Blinktempo 1s/1s. Hier dann interpolation des PWM Wertes passend zum Gaswert. Mosfet wird angesteuert.
+- langer Druck zum kalibrieren des Max- und Min- Wertes des Empfängers und der Glühspannung
+- schneller Doppeldruck für Programm Kalibrierkurve
+- Evtl. noch Inaktivitätserkennung: Wenn 3min der Gashebel nicht betätigt wurde, schaltet er in Standby.
+*/
+
+
+//Serial.println(tast);
+    Button();
+
+    if (started==1 && tast==0)
+    {
+     interpolation();
+    }
+
+    else if (started==0)
+    {
+      blink(1, 100, 3000);
+      rxPwm=pulseIn(pin_rxPwmIn, HIGH);
+      myservo.writeMicroseconds(rxPwm);
+    }
+
+    if(tast==1)
+    {
+      tast=0;
+      start();
+      started=1;
+    }
+
+    else if (tast==2)
+    {
+      tast=0;
+      maxglow();
+    }
+
+    else if (tast==3)
+    {
+      tast=0;
+      kalibrierkurve();
+    }
+
+    if (inactivity()>0)
+    {
+      started=0;
+    }
+
+
+}
